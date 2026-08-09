@@ -1,0 +1,9 @@
+.venv/
+dumps/
+tools/frida/
+dist/
+logs/
+__pycache__/
+*.pyc
+hits.json
+*.bin
