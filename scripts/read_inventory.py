@@ -23,10 +23,10 @@ ITEM_NAMES = {
     10313: "紫晶石",
     10314: "血精石",
     10315: "原石精华",
-    33017: "战魂自选礼盒",
+    31073: "战魂自选礼盒",
 }
 
-ANCHOR_IDS = [33017, 10300, 10301, 10302, 10304, 10311, 10312, 10313, 10314, 10315]
+ANCHOR_IDS = [31073, 10300, 10301, 10302, 10304, 10311, 10312, 10313, 10314, 10315]
 
 
 def adb_text(*args):
@@ -271,12 +271,12 @@ def main():
         backpack_extra = {}
         for base in backpack_bases:
             pairs = decode_around(mm, entries, base)
-            if (33017, 5) in pairs:
+            if (31073, 5) in pairs:
                 counts = read_chain_counts(mm, base, BACKPACK_CHAIN)
                 for idv, cnt in counts.items():
                     backpack_counts.setdefault(idv, []).append(cnt)
                 for (idv, cnt), addr in pairs.items():
-                    if idv == 33017:
+                    if idv == 31073:
                         backpack_extra.setdefault(idv, []).append(cnt)
 
         main_best = most_frequent(main_counts)
