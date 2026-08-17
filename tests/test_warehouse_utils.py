@@ -1,4 +1,9 @@
-from scripts.warehouse import deal_max_display, display_to_deal_num, display_unit
+from scripts.warehouse import (
+    adjust_bag_gold,
+    deal_max_display,
+    display_to_deal_num,
+    display_unit,
+)
 
 
 def test_gold_display_to_deal_num():
@@ -34,3 +39,16 @@ def test_normal_item_deal_max():
 
 def test_gold_deal_max_uses_display_unit():
     assert deal_max_display(10000, 74450000) == 7445
+
+
+def test_adjust_bag_gold_deposit_reduces_bag():
+    # 存入 10 亿：提交 raw = 10 × 10000 = 100000，背包 raw 减少
+    assert adjust_bag_gold(817676845, 100000) == 817576845
+
+
+def test_adjust_bag_gold_withdraw_increases_bag():
+    assert adjust_bag_gold(817676845, -100000) == 817776845
+
+
+def test_adjust_bag_gold_zero_deal():
+    assert adjust_bag_gold(817676845, 0) == 817676845

@@ -8,6 +8,8 @@ from scripts.proxy_pool import (
     ProxyPool,
     fetch_proxies,
     mask_proxy,
+    normalize_api_url,
+    _lifetime_minutes,
 )
 
 
@@ -92,6 +94,54 @@ def test_fetch_error_ret_raises(monkeypatch):
     _patch_api(monkeypatch, {"ret": 500, "msg": "bad key"})
     with pytest.raises(RuntimeError, match="bad key"):
         fetch_proxies("http://api.test/")
+
+
+def test_normalize_api_url_adds_missing_params():
+    url = normalize_api_url("https://api.example/proxy/?service=GetIp&authkey=k1")
+    assert "service=GetIp" in url
+    assert "authkey=k1" in url
+    assert "format=json" in url
+    assert "detail=1" in url
+    assert "lifetime=5" in url
+
+
+def test_normalize_api_url_keeps_existing_params():
+    url = normalize_api_url(
+        "https://api.example/?a=1&lifetime=15&format=txt&detail=0"
+    )
+    assert "lifetime=15" in url
+    assert "format=txt" in url
+    assert "detail=0" in url
+    assert url.count("lifetime=") == 1
+    assert url.count("detail=") == 1
+
+
+def test_lifetime_default_is_five():
+    assert _lifetime_minutes("https://api.example/?service=x") == 5
+    assert _lifetime_minutes("https://api.example/?lifetime=15") == 15
+
+
+def test_fetch_uses_server_deadline_over_url_lifetime(monkeypatch):
+    _patch_api(
+        monkeypatch,
+        {
+            "ret": 200,
+            "data": [
+                {
+                    "ip": "9.9.9.9",
+                    "port": "8080",
+                    "user": "",
+                    "pwd": "",
+                    "deadline": "2026-08-16 21:43:16",
+                }
+            ],
+        },
+    )
+    entries = fetch_proxies("http://api.test/?lifetime=5")
+    import datetime
+
+    expected = datetime.datetime(2026, 8, 16, 21, 43, 16).timestamp()
+    assert abs(entries[0]["deadline_ts"] - expected) < 2
 
 
 def test_proxy_url_encodes_credentials():
@@ -194,6 +244,68 @@ def test_pool_mark_failed_removes_entry(monkeypatch):
     ]
     pool.mark_failed("http://u:p@1.1.1.1:1")
     assert pool.next() is None
+
+
+def _entry(host, deadline_ts=None):
+    return {
+        "proxy": f"http://u:p@{host}",
+        "deadline_ts": deadline_ts or (time.time() + 300),
+        "used": 0,
+        "host": host,
+    }
+
+
+def test_pool_binds_account_to_proxy():
+    pool = ProxyPool(api_url="", per_ip_cap=8, random_order=False)
+    pool._entries = [_entry("1.1.1.1:1")]
+    first = pool.next("acc1")
+    second = pool.next("acc1")
+    assert first == second == "http://u:p@1.1.1.1:1"
+    assert pool._entries[0]["used"] == 2
+    assert pool._bindings.get("acc1") == first
+
+
+def test_pool_accounts_get_own_proxy_under_cap():
+    pool = ProxyPool(api_url="", per_ip_cap=1, random_order=False)
+    pool._entries = [_entry("1.1.1.1:1"), _entry("2.2.2.2:2")]
+    a1 = pool.next("acc1")
+    a2 = pool.next("acc2")
+    assert a1 == "http://u:p@1.1.1.1:1"
+    # 1.1.1.1 已满（cap=1），acc2 自动换到第二个 IP
+    assert a2 == "http://u:p@2.2.2.2:2"
+
+
+def test_pool_rebinds_after_proxy_expires(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_fetch(api_url, timeout=15.0):
+        calls["n"] += 1
+        return [_entry("9.9.9.9:9")]
+
+    monkeypatch.setattr("scripts.proxy_pool.fetch_proxies", fake_fetch)
+    pool = ProxyPool("http://api.test/", per_ip_cap=8, random_order=False)
+    pool._entries = [_entry("1.1.1.1:1", deadline_ts=time.time() - 10)]
+    got = pool.next("acc1")
+    assert got == "http://u:p@9.9.9.9:9"
+    assert pool._bindings.get("acc1") == got
+    assert calls["n"] == 1
+
+
+def test_pool_mark_failed_clears_binding(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_fetch(api_url, timeout=15.0):
+        calls["n"] += 1
+        return [_entry("8.8.8.8:8")]
+
+    monkeypatch.setattr("scripts.proxy_pool.fetch_proxies", fake_fetch)
+    pool = ProxyPool("http://api.test/", per_ip_cap=8, random_order=False)
+    pool._entries = [_entry("1.1.1.1:1")]
+    first = pool.next("acc1")
+    pool.mark_failed(first)
+    assert pool._bindings.get("acc1") is None
+    got = pool.next("acc1")
+    assert got == "http://u:p@8.8.8.8:8"
 
 
 def test_mask_proxy_hides_credentials():

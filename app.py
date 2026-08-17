@@ -79,11 +79,16 @@ from scripts.proxy_pool import (
     mask_proxy,
     save_proxy_config,
 )
-from scripts.warehouse import deal_max_display, display_to_deal_num, display_unit
+from scripts.warehouse import (
+    adjust_bag_gold,
+    deal_max_display,
+    display_to_deal_num,
+    display_unit,
+)
 
 # 【部署配置】服务器地址内置，登录界面不展示；更换服务器时修改此处后重新打包/热更新
 DEFAULT_SERVER_URL = "http://47.100.188.139:18432"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.4"
 
 # 【美化新增-浅色Fluent】全局主题样式
 THEME_QSS = """
@@ -129,7 +134,7 @@ QPushButton:disabled {
     color: #0078D4;
     font-weight: 600;
 }
-QLineEdit, QSpinBox {
+QLineEdit {
     background-color: #FFFFFF;
     border: 1px solid #D0D0D0;
     border-radius: 6px;
@@ -138,15 +143,22 @@ QLineEdit, QSpinBox {
     selection-background-color: #E5F1FB;
     selection-color: #1B1B1B;
 }
-QLineEdit:hover, QSpinBox:hover {
+QLineEdit:hover {
     border-color: #0078D4;
 }
-QLineEdit:focus, QSpinBox:focus {
+QLineEdit:focus {
     border-color: #0078D4;
 }
-QLineEdit:disabled, QSpinBox:disabled {
+QLineEdit:disabled {
     background-color: #F5F5F5;
     color: #BDBDBD;
+}
+QSpinBox#plainSpin {
+    background-color: #FFFFFF;
+    border: 1px solid #D0D0D0;
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #1B1B1B;
 }
 QSpinBox#plainSpin::up-button, QSpinBox#plainSpin::down-button {
     width: 0;
@@ -427,49 +439,66 @@ class HeartbeatThread(QThread):
 class AccountDataThread(QThread):
     done = Signal(object)
     failed = Signal(str)
+    cached = Signal(str)
+    relogin = Signal(str)
 
     def __init__(
         self,
+        store,
         account: str,
         password: str,
         device_code: str | None = None,
         proxy: str | None = None,
         delay: float = 0,
+        force_login: bool = False,
     ):
         super().__init__()
+        self._store = store
         self._account = account
         self._password = password
         self._device_code = device_code
         self._proxy = proxy
         self._delay = delay
+        self._force_login = force_login
 
     def run(self):
         try:
             if self._delay > 0:
                 time.sleep(self._delay)
-            session = security_center.get_session(
-                self._account, self._password, self._device_code, self._proxy
+
+            def _query(session: dict) -> dict:
+                bag = bydsj_client.get_bag(
+                    session["user_id"], session["token"], self._proxy
+                )
+                repo = warehouse.get_repo(
+                    session["user_id"], session["token"], proxy=self._proxy
+                )
+                items = {pid: bag.get(pid, 0) for pid, _ in bydsj_client.ITEMS}
+                return {
+                    "account": self._account,
+                    "user_id": session["user_id"],
+                    "nickname": session.get("nickname") or "",
+                    "money": session.get("money", 0),
+                    "diamond": session.get("diamond", 0),
+                    "mobile": session.get("mobile") or "",
+                    "device_code": session.get("device_code") or "",
+                    "total_infull_num": session.get("total_infull_num", 0),
+                    "cannon": session.get("cannon", 0),
+                    "items": items,
+                    "repo": repo,
+                }
+
+            result = security_center.run_with_session(
+                self._store,
+                self._account,
+                self._password,
+                self._device_code,
+                self._proxy,
+                _query,
+                force=self._force_login,
+                on_cached=lambda: self.cached.emit(self._account),
+                on_relogin=lambda: self.relogin.emit(self._account),
             )
-            bag = bydsj_client.get_bag(
-                session["user_id"], session["token"], self._proxy
-            )
-            repo = warehouse.get_repo(
-                session["user_id"], session["token"], proxy=self._proxy
-            )
-            items = {pid: bag.get(pid, 0) for pid, _ in bydsj_client.ITEMS}
-            result = {
-                "account": self._account,
-                "user_id": session["user_id"],
-                "nickname": session.get("nickname") or "",
-                "money": session.get("money", 0),
-                "diamond": session.get("diamond", 0),
-                "mobile": session.get("mobile") or "",
-                "device_code": session.get("device_code") or "",
-                "total_infull_num": session.get("total_infull_num", 0),
-                "cannon": session.get("cannon", 0),
-                "items": items,
-                "repo": repo,
-            }
             self.done.emit(result)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
@@ -481,12 +510,14 @@ class TrustCheckThread(QThread):
 
     def __init__(
         self,
+        store,
         account: str,
         password: str,
         device_code: str | None = None,
         proxy: str | None = None,
     ):
         super().__init__()
+        self._store = store
         self._account = account
         self._password = password
         self._device_code = device_code
@@ -494,13 +525,21 @@ class TrustCheckThread(QThread):
 
     def run(self):
         try:
-            session = security_center.get_session(
-                self._account, self._password, self._device_code, self._proxy
+            payload = security_center.run_with_session(
+                self._store,
+                self._account,
+                self._password,
+                self._device_code,
+                self._proxy,
+                fn=lambda session: (
+                    session,
+                    security_center.check_trust(
+                        session, proxy=self._proxy
+                    ).get("ifOpen")
+                    == 1,
+                ),
             )
-            trusted = security_center.check_trust(
-                session, proxy=self._proxy
-            ).get("ifOpen") == 1
-            self.done.emit((session, trusted))
+            self.done.emit(payload)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -596,6 +635,7 @@ class DashijieSessionThread(QThread):
 
     def __init__(
         self,
+        store,
         account: str,
         password: str,
         device_code: str | None = None,
@@ -603,6 +643,7 @@ class DashijieSessionThread(QThread):
         require_device: bool = True,
     ):
         super().__init__()
+        self._store = store
         self._account = account
         self._password = password
         self._device_code = device_code
@@ -612,11 +653,13 @@ class DashijieSessionThread(QThread):
     def run(self):
         try:
             self.done.emit(
-                security_center.get_session(
+                security_center.run_with_session(
+                    self._store,
                     self._account,
                     self._password,
                     self._device_code,
                     self._proxy,
+                    fn=lambda session: session,
                     require_device=self._require_device,
                 )
             )
@@ -833,6 +876,7 @@ class BatchRefreshWorker(QThread):
 
     def __init__(
         self,
+        store,
         accounts: list[dict],
         pool: ProxyPool,
         delay_min: int,
@@ -840,6 +884,7 @@ class BatchRefreshWorker(QThread):
         enabled: bool,
     ):
         super().__init__()
+        self._store = store
         self._accounts = accounts
         self._pool = pool
         self._delay_min = delay_min
@@ -851,32 +896,42 @@ class BatchRefreshWorker(QThread):
         self._stop = True
 
     def _query(self, account: dict, proxy: str | None) -> dict:
-        session = security_center.get_session(
+        def _do(session: dict) -> dict:
+            bag = bydsj_client.get_bag(
+                session["user_id"], session["token"], proxy
+            )
+            repo = warehouse.get_repo(
+                session["user_id"], session["token"], proxy=proxy
+            )
+            items = {pid: bag.get(pid, 0) for pid, _ in bydsj_client.ITEMS}
+            return {
+                "account": account["account"],
+                "user_id": session["user_id"],
+                "nickname": session.get("nickname") or "",
+                "money": session.get("money", 0),
+                "diamond": session.get("diamond", 0),
+                "mobile": session.get("mobile") or "",
+                "device_code": session.get("device_code") or "",
+                "total_infull_num": session.get("total_infull_num", 0),
+                "cannon": session.get("cannon", 0),
+                "items": items,
+                "repo": repo,
+            }
+
+        return security_center.run_with_session(
+            self._store,
             account["account"],
             account["password"],
             account["device_code"] or None,
             proxy,
+            _do,
+            on_cached=lambda: self.status.emit(
+                f"账号 {account['account']} 使用缓存会话（金币为缓存值）"
+            ),
+            on_relogin=lambda: self.status.emit(
+                f"账号 {account['account']} 会话失效，已自动重新登录"
+            ),
         )
-        bag = bydsj_client.get_bag(
-            session["user_id"], session["token"], proxy
-        )
-        repo = warehouse.get_repo(
-            session["user_id"], session["token"], proxy=proxy
-        )
-        items = {pid: bag.get(pid, 0) for pid, _ in bydsj_client.ITEMS}
-        return {
-            "account": account["account"],
-            "user_id": session["user_id"],
-            "nickname": session.get("nickname") or "",
-            "money": session.get("money", 0),
-            "diamond": session.get("diamond", 0),
-            "mobile": session.get("mobile") or "",
-            "device_code": session.get("device_code") or "",
-            "total_infull_num": session.get("total_infull_num", 0),
-            "cannon": session.get("cannon", 0),
-            "items": items,
-            "repo": repo,
-        }
 
     def run(self):
         total = len(self._accounts)
@@ -897,7 +952,7 @@ class BatchRefreshWorker(QThread):
             )
             proxy = None
             if self._enabled:
-                proxy = self._pool.next()
+                proxy = self._pool.next(account["account"])
                 if proxy:
                     self.status.emit(f"使用代理 {self._pool.mask(proxy)}")
                 else:
@@ -914,7 +969,7 @@ class BatchRefreshWorker(QThread):
                 message = str(exc)
                 if proxy:
                     self._pool.mark_failed(proxy)
-                    retry_proxy = self._pool.next()
+                    retry_proxy = self._pool.next(account["account"])
                     if retry_proxy:
                         try:
                             result = self._query(account, retry_proxy)
@@ -929,45 +984,79 @@ class BatchRefreshWorker(QThread):
 
 
 class WelfareWorker(QThread):
-    """批量领取福利：每个账号登录后领取，成功后由界面取消勾选。"""
+    """批量领取福利：每个账号按固定顺序领取勾选的福利类型，成功后由界面取消勾选。"""
 
-    done = Signal(int, str, str, object)  # account_id, account, kind, result
+    done = Signal(int, str, object)  # account_id, account, results{kind: result|Exception}
     failed = Signal(str, str, str)  # account, message, proxy
     status = Signal(str)
     finished_all = Signal()
 
     def __init__(
         self,
+        store,
         accounts: list[dict],
         pool: ProxyPool,
         delay_min: int,
         delay_max: int,
         enabled: bool,
-        kind: str,
+        kinds: list[str],
     ):
         super().__init__()
+        self._store = store
         self._accounts = accounts
         self._pool = pool
         self._delay_min = delay_min
         self._delay_max = delay_max
         self._enabled = enabled
-        self._kind = kind
+        self._kinds = list(kinds)
         self._stop = False
 
     def stop(self) -> None:
         self._stop = True
 
-    def _claim(self, account: dict, proxy: str | None) -> dict:
-        session = security_center.get_session(
+    def _claim_one(self, kind: str, account: dict, proxy: str | None) -> dict:
+        def _do(session: dict, _kind: str = kind) -> dict:
+            uid, token = session["user_id"], session["token"]
+            if _kind == "vip_daily":
+                return welfare.claim_vip_daily(uid, token, proxy)
+            return welfare.claim_thanksgiving_full(uid, token, proxy)
+
+        return security_center.run_with_session(
+            self._store,
             account["account"],
             account["password"],
             account["device_code"] or None,
             proxy,
+            _do,
+            on_cached=lambda: self.status.emit(
+                f"账号 {account['account']} 使用缓存会话"
+            ),
+            on_relogin=lambda: self.status.emit(
+                f"账号 {account['account']} 会话失效，已自动重新登录"
+            ),
         )
-        uid, token = session["user_id"], session["token"]
-        if self._kind == "vip_daily":
-            return welfare.claim_vip_daily(uid, token, proxy)
-        return welfare.claim_thanksgiving_full(uid, token, proxy)
+
+    def _claim(self, account: dict, proxy: str | None) -> dict:
+        """按固定顺序领取勾选类型；单类型失败不中断其它类型。
+
+        每个类型独立走 run_with_session（复用缓存会话，失效才自动重登，
+        避免重试时重复领取已成功的类型）。全部失败时抛错（供代理重试）。
+        """
+        results: dict = {}
+        errors: list[str] = []
+        for kind in self._kinds:
+            try:
+                results[kind] = self._claim_one(kind, account, proxy)
+            except Exception as exc:  # noqa: BLE001
+                results[kind] = exc
+                errors.append(f"{self._welfare_kind_label(kind)}：{exc}")
+        if errors and len(errors) == len(self._kinds):
+            raise RuntimeError("；".join(errors))
+        return results
+
+    @staticmethod
+    def _welfare_kind_label(kind: str) -> str:
+        return "每日VIP福利" if kind == "vip_daily" else "感恩日VIP尊享福利"
 
     def run(self):
         total = len(self._accounts)
@@ -988,7 +1077,7 @@ class WelfareWorker(QThread):
             )
             proxy = None
             if self._enabled:
-                proxy = self._pool.next()
+                proxy = self._pool.next(account["account"])
                 if proxy:
                     self.status.emit(f"使用代理 {self._pool.mask(proxy)}")
                 else:
@@ -1000,17 +1089,17 @@ class WelfareWorker(QThread):
                     continue
             try:
                 result = self._claim(account, proxy)
-                self.done.emit(account["id"], account["account"], self._kind, result)
+                self.done.emit(account["id"], account["account"], result)
             except Exception as exc:  # noqa: BLE001
                 message = str(exc)
                 if proxy:
                     self._pool.mark_failed(proxy)
-                    retry_proxy = self._pool.next()
+                    retry_proxy = self._pool.next(account["account"])
                     if retry_proxy:
                         try:
                             result = self._claim(account, retry_proxy)
                             self.done.emit(
-                                account["id"], account["account"], self._kind, result
+                                account["id"], account["account"], result
                             )
                             continue
                         except Exception as exc2:  # noqa: BLE001
@@ -1020,29 +1109,62 @@ class WelfareWorker(QThread):
 
 
 class QuantityDialog(QDialog):
+    submitted = Signal(int)
+
     def __init__(
         self,
         title: str,
         maximum: int,
         unit: str = "个",
         available: int | None = None,
+        per_op_max: int | None = None,
     ):
         super().__init__()
         self.setWindowTitle(title)
+        self._unit = unit
+        self._per_op_max = max(1, per_op_max or maximum)
         layout = QVBoxLayout(self)
         if available is None:
             available = maximum
-        layout.addWidget(QLabel(f"可用数量：{available} {unit}"))
+        self.lbl_available = QLabel(f"可用数量：{available} {unit}")
+        layout.addWidget(self.lbl_available)
         self.spin = QSpinBox()
-        self.spin.setRange(1, max(1, maximum))
+        self.spin.setRange(1, self._per_op_max)
         self.spin.setValue(1)
         self.spin.setMinimumWidth(240)
         self.spin.setFixedHeight(42)
         self.spin.setStyleSheet("font-size: 18px;")
         layout.addWidget(self.spin)
-        btn = QPushButton("确定")
-        btn.clicked.connect(self.accept)
-        layout.addWidget(btn)
+        self.lbl_status = QLabel("")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status)
+        buttons = QHBoxLayout()
+        btn_all = QPushButton("全部存取")
+        btn_all.clicked.connect(self._submit_all)
+        buttons.addWidget(btn_all)
+        btn_ok = QPushButton("确定")
+        btn_ok.clicked.connect(self._submit)
+        buttons.addWidget(btn_ok)
+        btn_done = QPushButton("完成")
+        btn_done.clicked.connect(self.accept)
+        buttons.addWidget(btn_done)
+        layout.addLayout(buttons)
+
+    def _submit(self):
+        self.submitted.emit(self.spin.value())
+
+    def _submit_all(self):
+        """“全部存取”：本次按单次上限填满并提交，弹窗保持打开可继续。"""
+        self.spin.setValue(self._per_op_max)
+        self.submitted.emit(self.spin.value())
+
+    def update_available(self, remaining: int, unit: str | None = None):
+        unit = unit or self._unit
+        self.lbl_available.setText(f"可用数量：{remaining} {unit}")
+        self.spin.setRange(1, max(1, min(self._per_op_max, remaining)))
+
+    def set_status(self, text: str):
+        self.lbl_status.setText(text)
 
 
 class EditAccountDialog(QDialog):
@@ -1161,6 +1283,7 @@ class ChangePasswordDialog(QDialog):
         batch_index: int | None = None,
         batch_total: int | None = None,
         proxy: str | None = None,
+        store=None,
     ):
         super().__init__()
         title = "修改登录密码"
@@ -1169,6 +1292,7 @@ class ChangePasswordDialog(QDialog):
         self.setWindowTitle(title)
         self._account = account
         self._proxy = proxy
+        self._store = store
         self._login_info = None
         self._session = None
         self._thread = None
@@ -1226,6 +1350,7 @@ class ChangePasswordDialog(QDialog):
         else:
             self.lbl_status.setText("正在获取会话并发送验证码...")
             self._thread = DashijieSessionThread(
+                self._store,
                 self._account["account"],
                 old,
                 self._account.get("device_code") or None,
@@ -1395,13 +1520,16 @@ class MainWindow(QMainWindow):
         self._card_key = card_key
         self._thread = None
         self._loading_accounts = False
-        self._pending_deal = None
+        self._deal_ctx = None
+        self._deal_dialog = None
+        self._deal_busy = False
         self._last_checked_row = -1
-        self._deal_proxy = None
+        self._pending_gold_adjust = 0
+        self._pending_gold_adjust_account = ""
+        self._pending_gold_adjust_base = 0
         self._batch_worker = None
         self._welfare_worker = None
         self._welfare_btn = None
-        self._welfare_kind = "vip_daily"
         self._bag_qty: dict[int, int] = {}
         self._warehouse_qty: dict[int, int] = {}
         self._proxy_cfg = load_proxy_config()
@@ -1509,16 +1637,13 @@ class MainWindow(QMainWindow):
 
         welfare_row = QHBoxLayout()
         welfare_row.setSpacing(6)
-        self.btn_vip_daily = QPushButton("每日vip福利领取")
-        self.btn_vip_daily.clicked.connect(
-            lambda: self._on_batch_welfare("vip_daily")
-        )
-        welfare_row.addWidget(self.btn_vip_daily)
-        self.btn_thanksgiving = QPushButton("感恩日领取")
-        self.btn_thanksgiving.clicked.connect(
-            lambda: self._on_batch_welfare("thanksgiving")
-        )
-        welfare_row.addWidget(self.btn_thanksgiving)
+        self.chk_vip_daily = QCheckBox("每日vip福利领取")
+        self.chk_thanksgiving = QCheckBox("感恩日领取")
+        self.btn_welfare_start = QPushButton("开始领取")
+        self.btn_welfare_start.clicked.connect(self._on_batch_welfare)
+        welfare_row.addWidget(self.chk_vip_daily)
+        welfare_row.addWidget(self.chk_thanksgiving)
+        welfare_row.addWidget(self.btn_welfare_start)
         welfare_row.addStretch()
         left.addLayout(welfare_row)
 
@@ -1597,6 +1722,9 @@ class MainWindow(QMainWindow):
         self.btn_open_log = QPushButton("打开日志目录")
         self.btn_open_log.clicked.connect(self._open_log_dir)
         log_header.addWidget(self.btn_open_log)
+        self.btn_open_updates = QPushButton("打开更新目录")
+        self.btn_open_updates.clicked.connect(self._open_updates_dir)
+        log_header.addWidget(self.btn_open_updates)
         right.addLayout(log_header)
         self.txt_log = QPlainTextEdit()
         # 【美化新增-浅色Fluent】objectName
@@ -1687,36 +1815,12 @@ class MainWindow(QMainWindow):
             keep_checked = {
                 self._account_at(r)["account"] for r in checked_rows
             }
-        seq = []
-        for r in range(self.table_accounts.rowCount()):
-            row_id = self.table_accounts.item(r, 0).data(Qt.UserRole)
-            if row_id is None:
-                contents = [
-                    self.table_accounts.item(r, c).text()
-                    if self.table_accounts.item(r, c)
-                    else ""
-                    for c in (2, 3, 4, 5, 6, 8)
-                ]
-                seq.append(("blank", contents))
-            else:
-                seq.append(("db", row_id))
-        blank_rows = []
-        for i, entry in enumerate(seq):
-            if entry[0] != "blank":
-                continue
-            prev_id = next(
-                (seq[j][1] for j in range(i - 1, -1, -1) if seq[j][0] == "db"),
-                None,
-            )
-            next_id = next(
-                (seq[j][1] for j in range(i + 1, len(seq)) if seq[j][0] == "db"),
-                None,
-            )
-            blank_rows.append((prev_id, next_id, entry[1]))
         self._loading_accounts = True
         self.table_accounts.setRowCount(0)
         items = self._store.list_accounts()
         for row, item in enumerate(items):
+            is_blank = bool(item.get("is_blank"))
+            display_account = "" if is_blank else item["account"]
             self.table_accounts.insertRow(row)
             id_item = QTableWidgetItem(str(row + 1))
             id_item.setData(Qt.UserRole, item["id"])
@@ -1724,9 +1828,9 @@ class MainWindow(QMainWindow):
             check_item = QTableWidgetItem()
             check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
             check_item.setCheckState(
-                Qt.Checked if item["account"] in keep_checked else Qt.Unchecked
+                Qt.Checked if display_account in keep_checked else Qt.Unchecked
             )
-            if item["account"] in keep_checked:
+            if display_account in keep_checked:
                 self._last_checked_row = row
             nickname_item = QTableWidgetItem(item.get("nickname") or "")
             nickname_item.setFlags(nickname_item.flags() & ~Qt.ItemIsEditable)
@@ -1735,7 +1839,7 @@ class MainWindow(QMainWindow):
             total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
             self.table_accounts.setItem(row, 0, id_item)
             self.table_accounts.setItem(row, 1, check_item)
-            self.table_accounts.setItem(row, 2, QTableWidgetItem(item["account"]))
+            self.table_accounts.setItem(row, 2, QTableWidgetItem(display_account))
             self.table_accounts.setItem(row, 3, QTableWidgetItem(item["password"]))
             self.table_accounts.setItem(row, 4, QTableWidgetItem(item["secondary_password"]))
             self.table_accounts.setItem(row, 5, QTableWidgetItem(item.get("phone") or ""))
@@ -1743,21 +1847,6 @@ class MainWindow(QMainWindow):
             self.table_accounts.setItem(row, 7, nickname_item)
             self.table_accounts.setItem(row, 8, cannon_item)
             self.table_accounts.setItem(row, 9, total_item)
-        index_of = {item["id"]: index for index, item in enumerate(items)}
-        inserted_blanks = 0
-        for prev_id, next_id, contents in blank_rows:
-            if next_id in index_of:
-                insert_at = index_of[next_id] + inserted_blanks
-            elif prev_id in index_of:
-                insert_at = index_of[prev_id] + 1 + inserted_blanks
-            else:
-                insert_at = len(items) + inserted_blanks
-            self._insert_blank_row(insert_at)
-            for col, text in zip((2, 3, 4, 5, 6, 8), contents):
-                self.table_accounts.item(insert_at, col).setText(text)
-            if self._last_checked_row >= insert_at:
-                self._last_checked_row += 1
-            inserted_blanks += 1
         self._renumber_rows()
         self._loading_accounts = False
 
@@ -1799,21 +1888,25 @@ class MainWindow(QMainWindow):
             row = item.row()
             if item.checkState() == Qt.Checked:
                 account = self._account_at(row)
-                if not account or not account["account"].strip():
-                    QMessageBox.warning(self, "提示", "该行尚未填写游戏账号，请先填写账号")
-                    self._loading_accounts = True
-                    item.setCheckState(Qt.Unchecked)
-                    self._loading_accounts = False
-                    return
-                if not (account.get("password") or "").strip():
-                    QMessageBox.warning(self, "提示", "该账号未设置密码，请先编辑填写密码")
-                    self._loading_accounts = True
-                    item.setCheckState(Qt.Unchecked)
-                    self._loading_accounts = False
-                    return
-                self._last_checked_row = row
-                self.table_accounts.selectRow(row)
-                self.lbl_status.setText(f"已选择账号 {account['account']}，点击手动刷新查询")
+                if account and account["account"].strip():
+                    if not (account.get("password") or "").strip():
+                        QMessageBox.warning(self, "提示", "该账号未设置密码，请先编辑填写密码")
+                        self._loading_accounts = True
+                        item.setCheckState(Qt.Unchecked)
+                        self._loading_accounts = False
+                        return
+                    self._last_checked_row = row
+                    self.table_accounts.selectRow(row)
+                    self.lbl_status.setText(
+                        f"已选择账号 {account['account']}，点击手动刷新查询"
+                    )
+                else:
+                    # 空白行可勾选（用于批量删除；执行型批量操作会自动跳过）
+                    self._last_checked_row = row
+                    self.table_accounts.selectRow(row)
+                    self.lbl_status.setText(
+                        f"已选择空白行（第 {row + 1} 行），可用于批量删除"
+                    )
             elif row == self._last_checked_row:
                 checked = self._checked_rows()
                 self._last_checked_row = checked[-1] if checked else -1
@@ -1840,14 +1933,44 @@ class MainWindow(QMainWindow):
                 return
         row_data = self._account_at(row)
         account = row_data["account"].strip()
+        is_blank_old = bool(old and old.get("is_blank"))
         if not account:
             if old:
+                if is_blank_old:
+                    # 空白行：可先保存密码/设备码等字段，暂不转正
+                    self._store.update_account(
+                        old["id"],
+                        row_data["password"],
+                        row_data["secondary_password"],
+                        row_data["device_code"],
+                        row_data["phone"],
+                        None,
+                        None,
+                        None,
+                        int(row_data["cannon"] or 0),
+                        is_blank=1,
+                    )
+                    self._append_log(
+                        f"空白行字段保存：字段={field_map[column]} 旧值={old_value} 新值={new_value}"
+                    )
+                    return
                 QMessageBox.warning(self, "提示", "游戏账号不能为空，已恢复原值")
                 self._reload_accounts()
             return
         login_type = query_service.login_type_of(account)
         try:
             if old:
+                if is_blank_old:
+                    existing = self._store.list_accounts()
+                    if any(
+                        a["id"] != old["id"] and a["account"] == account
+                        for a in existing
+                    ):
+                        QMessageBox.warning(self, "提示", f"账号 {account} 已存在，请直接编辑原有账号")
+                        self._loading_accounts = True
+                        item.setText("")
+                        self._loading_accounts = False
+                        return
                 self._store.update_account(
                     old["id"],
                     row_data["password"],
@@ -1858,6 +1981,7 @@ class MainWindow(QMainWindow):
                     None,
                     account,
                     int(row_data["cannon"] or 0),
+                    is_blank=0,
                 )
                 self._append_log(
                     f"修改账号字段：账号={account} 字段={field_map[column]} 旧值={old_value} 新值={new_value}"
@@ -1926,6 +2050,10 @@ class MainWindow(QMainWindow):
             self.table_accounts.setItem(row, 9, total_item)
         finally:
             self._loading_accounts = prev_loading
+        # 空白行持久化：写入账号库并绑定 id，随后统一重排保存顺序
+        record = self._store.add_blank_row()
+        self.table_accounts.item(row, 0).setData(Qt.UserRole, record["id"])
+        self._renumber_rows()
 
     def _insert_rows(self, anchor_row: int, above: bool) -> None:
         count, ok = QInputDialog.getInt(
@@ -1972,7 +2100,13 @@ class MainWindow(QMainWindow):
         action_below = menu.addAction("在下方插入行")
         action_copy = menu.addAction("复制")
         menu.addSeparator()
-        action_delete_row = menu.addAction("删除此行")
+        checked_rows = self._checked_rows()
+        if checked_rows:
+            action_delete_row = menu.addAction(
+                f"删除勾选的 {len(checked_rows)} 行"
+            )
+        else:
+            action_delete_row = menu.addAction("删除此行")
         action_login = action_refresh = action_edit = action_clear = action_paste = None
         if column == 2:
             menu.addSeparator()
@@ -1991,14 +2125,14 @@ class MainWindow(QMainWindow):
         elif action == action_copy:
             self._on_copy_accounts(row, column)
         elif action == action_delete_row:
-            self._delete_row(row)
+            self._delete_checked_rows(row)
         elif column == 2 and action == action_paste:
             self._on_paste_accounts(row)
         elif column == 2 and action == action_login:
             account = self._account_at(row)
             if account and account["account"].strip():
                 self._append_log(f"登录账号：{account['account']}")
-                self._start_refresh(account)
+                self._start_refresh(account, force_login=True)
             else:
                 self._append_log(f"第 {row + 1} 行为空，跳过登录")
         elif column == 2 and action == action_refresh:
@@ -2021,17 +2155,23 @@ class MainWindow(QMainWindow):
         prev_loading = self._loading_accounts
         self._loading_accounts = True
         try:
+            ids = []
             for r in range(self.table_accounts.rowCount()):
                 item = self.table_accounts.item(r, 0)
                 if item is not None:
                     item.setText(str(r + 1))
+                    rid = item.data(Qt.UserRole)
+                    if rid is not None:
+                        ids.append(rid)
+            if ids:
+                self._store.renumber_accounts(ids)
         finally:
             self._loading_accounts = prev_loading
 
     def _delete_row(self, row: int):
         row_id = self.table_accounts.item(row, 0).data(Qt.UserRole)
-        account_text = self.table_accounts.item(row, 2).text()
-        if row_id is not None:
+        account_text = self.table_accounts.item(row, 2).text().strip()
+        if account_text:
             if (
                 QMessageBox.question(
                     self, "确认", f"确定删除账号 {account_text} 所在行吗？"
@@ -2039,16 +2179,19 @@ class MainWindow(QMainWindow):
                 != QMessageBox.Yes
             ):
                 return
-            self._store.delete_account(row_id)
+            if row_id is not None:
+                self._store.delete_account(row_id)
             self._append_log(f"删除账号行：{account_text}（第 {row + 1} 行）")
         else:
             if (
                 QMessageBox.question(
-                    self, "确认", "确定删除该空白行吗？未保存的内容会丢失。"
+                    self, "确认", "确定删除该空白行吗？"
                 )
                 != QMessageBox.Yes
             ):
                 return
+            if row_id is not None:
+                self._store.delete_account(row_id)
             self._append_log(f"删除空白行（第 {row + 1} 行）")
         self.table_accounts.removeRow(row)
         if self._last_checked_row == row:
@@ -2056,6 +2199,58 @@ class MainWindow(QMainWindow):
         elif self._last_checked_row > row:
             self._last_checked_row -= 1
         self._renumber_rows()
+
+    def _delete_checked_rows(self, fallback_row: int):
+        """批量删除：只删除当前勾选的行；没有勾选时退回删除右键行。"""
+        rows = self._checked_rows()
+        if not rows:
+            self._delete_row(fallback_row)
+            return
+        names = []
+        for r in rows:
+            item = self.table_accounts.item(r, 2)
+            text = item.text().strip() if item else ""
+            names.append(text or f"第{r + 1}行(空)")
+        display = "、".join(names[:8])
+        if len(names) > 8:
+            display += f" 等 {len(names)} 个"
+        if (
+            QMessageBox.question(
+                self,
+                "确认",
+                f"确定删除勾选的 {len(rows)} 行吗？\n账号：{display}",
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        deleted_accounts = []
+        for r in sorted(rows, reverse=True):
+            id_item = self.table_accounts.item(r, 0)
+            row_id = id_item.data(Qt.UserRole) if id_item else None
+            account_item = self.table_accounts.item(r, 2)
+            account_text = account_item.text().strip() if account_item else ""
+            if row_id is not None:
+                self._store.delete_account(row_id)
+            if account_text:
+                deleted_accounts.append(account_text)
+            self.table_accounts.removeRow(r)
+        deleted_set = set(rows)
+        if self._last_checked_row in deleted_set:
+            self._last_checked_row = -1
+        else:
+            self._last_checked_row -= sum(
+                1 for r in rows if r < self._last_checked_row
+            )
+        self._renumber_rows()
+        row_nums = "、".join(str(r + 1) for r in rows)
+        detail = "、".join(deleted_accounts[:8])
+        if len(deleted_accounts) > 8:
+            detail += f" 等 {len(deleted_accounts)} 个"
+        self._append_log(
+            f"批量删除 {len(rows)} 行（第 {row_nums} 行"
+            + (f"，账号：{detail}" if detail else "")
+            + "）"
+        )
 
     def _on_copy_accounts(self, row: int | None = None, column: int | None = None):
         indexes = self.table_accounts.selectedIndexes()
@@ -2165,7 +2360,7 @@ class MainWindow(QMainWindow):
             )
 
         blank_flags = [
-            self.table_accounts.item(r, 0).data(Qt.UserRole) is None
+            not self.table_accounts.item(r, 2).text().strip()
             for r in range(self.table_accounts.rowCount())
         ]
         targets = paste_target_rows(blank_flags, anchor_row, len(unique))
@@ -2181,6 +2376,26 @@ class MainWindow(QMainWindow):
         )
 
     def _place_pasted_row(self, row_index: int, data: dict):
+        id_item = self.table_accounts.item(row_index, 0)
+        row_id = id_item.data(Qt.UserRole) if id_item else None
+        if (
+            row_id is not None
+            and not self.table_accounts.item(row_index, 2).text().strip()
+        ):
+            # 目标为已落库空白行：原位转正
+            self._store.update_account(
+                row_id,
+                data["password"],
+                data["secondary_password"],
+                data["device_code"],
+                data["phone"],
+                None,
+                None,
+                data["account"],
+                0,
+                is_blank=0,
+            )
+            return
         existing = self._store.list_accounts()
         db_index = sum(
             1
@@ -2246,120 +2461,227 @@ class MainWindow(QMainWindow):
             return
         unit = display_unit(prop_id)
         source_display = max_raw // 10000 if prop_id == 10000 else max_raw
-        max_display = deal_max_display(prop_id, max_raw)
-        if max_display <= 0:
+        per_op_max = deal_max_display(prop_id, max_raw)
+        if per_op_max <= 0:
             QMessageBox.information(self, "提示", "当前可用数量为 0 或已达到上限，无法操作")
             return
+        # 连续存取会话：弹窗保持打开，可多次提交；结束统一刷新一次
+        self._deal_ctx = {
+            "account": account,
+            "prop_id": prop_id,
+            "prop_name": prop_name,
+            "direction": direction,
+            "unit": unit,
+            "remaining_raw": max_raw,
+            "per_op_max": per_op_max,
+            "trusted": False,
+            "session": None,
+            "proxy": None,
+            "total_done": 0,
+            "gold_base": self._bag_qty.get(10000, 0) if prop_id == 10000 else 0,
+        }
+        if prop_id == 10000:
+            self._pending_gold_adjust = 0
+        self._deal_busy = False
         dialog = QuantityDialog(
-            f"输入数量（{unit}）", max_display, unit, available=source_display
+            f"输入数量（{unit}）",
+            per_op_max,
+            unit,
+            available=source_display,
+            per_op_max=per_op_max,
         )
-        if dialog.exec() != QDialog.Accepted:
+        dialog.submitted.connect(self._on_deal_submit)
+        self._deal_dialog = dialog
+        dialog.exec()
+        # 弹窗关闭：若有执行过存取，统一刷新一次
+        if self._deal_ctx and self._deal_ctx.get("total_done", 0) > 0:
+            self._on_refresh()
+        self._deal_ctx = None
+        self._deal_dialog = None
+
+    def _on_deal_submit(self, quantity: int):
+        ctx = self._deal_ctx
+        if not ctx:
             return
-        quantity = dialog.spin.value()
-        deal_num = display_to_deal_num(prop_id, quantity) * direction
-        action_text = "存入仓库" if direction > 0 else "取出到背包"
-        if (
-            QMessageBox.question(
-                self,
-                "确认操作",
-                f"账号：{account['account']}\n道具：{prop_name}\n数量：{quantity}{unit}\n方向：{action_text}\n确认执行吗？",
+        if self._deal_busy:
+            if self._deal_dialog:
+                self._deal_dialog.set_status("请等待当前操作完成")
+            return
+        deal_num = display_to_deal_num(ctx["prop_id"], quantity) * ctx["direction"]
+        ctx["current_num"] = deal_num
+        if not ctx["trusted"]:
+            if ctx["proxy"] is None and self.chk_proxy.isChecked():
+                if not self.edt_proxy_api.text().strip():
+                    QMessageBox.warning(self, "提示", "已启用代理，但未填写 API 链接")
+                    return
+                ctx["proxy"] = self._proxy_pool.next(ctx["account"]["account"])
+                if ctx["proxy"] is None:
+                    QMessageBox.warning(
+                        self, "代理获取失败",
+                        self._proxy_pool.last_error or "代理池为空",
+                    )
+                    return
+                self._append_log(f"使用代理 {self._proxy_pool.mask(ctx['proxy'])}")
+            self._deal_busy = True
+            self.lbl_status.setText("正在检查设备信任...")
+            self._thread = TrustCheckThread(
+                self._store,
+                ctx["account"]["account"],
+                ctx["account"]["password"],
+                ctx["account"]["device_code"] or None,
+                ctx["proxy"],
             )
-            != QMessageBox.Yes
-        ):
-            return
-        self._pending_deal = (account, prop_id, deal_num, quantity, unit)
-        self._deal_proxy = None
-        if self.chk_proxy.isChecked():
-            if not self.edt_proxy_api.text().strip():
-                QMessageBox.warning(self, "提示", "已启用代理，但未填写 API 链接")
-                self._pending_deal = None
-                return
-            self._deal_proxy = self._proxy_pool.next()
-            if self._deal_proxy is None:
-                QMessageBox.warning(
-                    self, "代理获取失败", self._proxy_pool.last_error or "代理池为空"
-                )
-                self._pending_deal = None
-                return
-            self._append_log(f"使用代理 {self._proxy_pool.mask(self._deal_proxy)}")
-        self._set_busy(True)
-        self.lbl_status.setText("正在检查设备信任...")
-        self._thread = TrustCheckThread(
-            account["account"],
-            account["password"],
-            account["device_code"] or None,
-            self._deal_proxy,
-        )
-        self._thread.done.connect(self._on_trust_check_done)
-        self._thread.failed.connect(self._on_thread_failed)
-        self._thread.start()
+            self._thread.done.connect(self._on_trust_check_done)
+            self._thread.failed.connect(self._on_thread_failed)
+            self._thread.start()
+        else:
+            self._execute_deal(ctx["session"])
 
     def _on_trust_check_done(self, payload):
+        ctx = self._deal_ctx
         session, trusted = payload
+        ctx["session"] = session
         if not trusted:
-            phone = self._pending_deal[0].get("phone") or session.get("mobile") or ""
-            dialog = TrustDialog(session, phone, self._deal_proxy)
+            phone = ctx["account"].get("phone") or session.get("mobile") or ""
+            dialog = TrustDialog(session, phone, ctx["proxy"])
             if dialog.exec() == QDialog.Accepted:
+                ctx["trusted"] = True
                 self._execute_deal(session)
             else:
-                self._set_busy(False)
-                self.lbl_status.setText("已取消信任设备")
+                self._deal_busy = False
+                if self._deal_dialog:
+                    self._deal_dialog.set_status("已取消信任设备")
             return
+        ctx["trusted"] = True
         self._execute_deal(session)
 
     def _execute_deal(self, session: dict):
-        account, prop_id, deal_num, _display_qty, _unit = self._pending_deal
+        ctx = self._deal_ctx
         self.lbl_status.setText("正在执行存取...")
         self._thread = WarehouseDealThread(
             session,
-            prop_id,
-            deal_num,
-            account["secondary_password"],
-            self._deal_proxy,
+            ctx["prop_id"],
+            ctx["current_num"],
+            ctx["account"]["secondary_password"],
+            ctx["proxy"],
         )
         self._thread.done.connect(self._on_deal_done)
-        self._thread.failed.connect(self._on_thread_failed)
+        self._thread.failed.connect(self._on_deal_failed)
         self._thread.start()
 
     def _on_deal_done(self, result):
-        account, prop_id, deal_num, display_qty, unit = self._pending_deal or (None, None, None, None, None)
-        if account:
-            direction = "存入仓库" if deal_num > 0 else "取出到背包"
+        ctx = self._deal_ctx
+        self._deal_busy = False
+        if not ctx:
+            return
+        moved = abs(ctx["current_num"])
+        ctx["remaining_raw"] = max(0, ctx["remaining_raw"] - moved)
+        ctx["total_done"] += 1
+        account, prop_id, direction, unit = (
+            ctx["account"],
+            ctx["prop_id"],
+            "存入仓库" if ctx["direction"] > 0 else "取出到背包",
+            ctx["unit"],
+        )
+        display_qty = moved // 10000 if prop_id == 10000 else moved
+        self._append_log(
+            f"存取成功：{account['account']} {direction} "
+            f"{bydsj_client.item_name(prop_id)} 数量={display_qty}{unit}"
+            f"（第 {ctx['total_done']} 次）"
+        )
+        if prop_id == 10000:
+            # 金币存取：仓库金币用接口返回值（权威）；背包金币在协议 raw（万）空间本地推算
+            repo_raw = result.get("leftRepoNum", self._warehouse_qty.get(10000, 0))
+            bag_raw = adjust_bag_gold(self._bag_qty.get(10000, 0), ctx["current_num"])
+            self._bag_qty[10000] = max(bag_raw, 0)
+            self._warehouse_qty[10000] = repo_raw
+            self._bag_cells[10000][1].setText(f"{self._bag_qty[10000] // 10000}亿")
+            self._warehouse_cells[10000][1].setText(f"{repo_raw // 10000}亿")
+            self._pending_gold_adjust += ctx["current_num"]
+            self._pending_gold_adjust_account = account["account"]
+            self._pending_gold_adjust_base = ctx["gold_base"]
             self._append_log(
-                f"存取成功：{account['account']} {direction} "
-                f"{bydsj_client.item_name(prop_id)} 数量={display_qty}{unit}"
+                f"金币存取：仓库金币按接口返回值更新，背包金币按差额本地更新（{display_qty}{unit}）"
             )
-        QMessageBox.information(self, "成功", "存取成功")
-        self._pending_deal = None
-        self._set_busy(False)
-        self._on_refresh()
+        remaining_display = (
+            ctx["remaining_raw"] // 10000 if prop_id == 10000 else ctx["remaining_raw"]
+        )
+        if self._deal_dialog:
+            self._deal_dialog.update_available(remaining_display, unit)
+            if ctx["remaining_raw"] <= 0:
+                self._deal_dialog.set_status("已全部处理完毕")
+                self._deal_dialog.accept()
+            else:
+                self._deal_dialog.set_status(
+                    f"成功，剩余 {remaining_display}{unit}，可继续输入"
+                )
+        self.lbl_status.setText("存取完成")
 
     def _on_thread_failed(self, message: str):
-        if self._pending_deal:
-            account, prop_id, deal_num, display_qty, unit = self._pending_deal
-            direction = "存入仓库" if deal_num > 0 else "取出到背包"
-            self._append_log(
-                f"存取失败：{account['account']} {direction} "
-                f"{bydsj_client.item_name(prop_id)} 数量={display_qty}{unit}：{message}"
-            )
-        self._pending_deal = None
+        if self._deal_ctx is not None:
+            # 连续存取会话中的信任/会话失败：提示到弹窗，不关闭
+            self._deal_busy = False
+            if self._deal_dialog:
+                self._deal_dialog.set_status(f"失败：{message}")
+            self.lbl_status.setText("操作失败")
+            return
         self._set_busy(False)
         self.lbl_status.setText("操作失败")
         QMessageBox.critical(self, "操作失败", message)
 
-    def _start_refresh(self, account: dict):
+    def _on_deal_failed(self, message: str):
+        """存取执行失败：响应中途断开（IncompleteRead）时结果不确定，提醒先刷新确认。"""
+        ctx = self._deal_ctx
+        self._deal_busy = False
+        uncertain = "IncompleteRead" in message
+        if ctx:
+            account, prop_id = ctx["account"], ctx["prop_id"]
+            direction = "存入仓库" if ctx["direction"] > 0 else "取出到背包"
+            moved = abs(ctx["current_num"])
+            display_qty = moved // 10000 if prop_id == 10000 else moved
+            self._append_log(
+                f"存取失败：{account['account']} {direction} "
+                f"{bydsj_client.item_name(prop_id)} 数量={display_qty}{ctx['unit']}：{message}"
+            )
+            if uncertain:
+                self._append_log(
+                    "响应中断，本次存取结果不确定，请先刷新确认实际数量，避免重复存取"
+                )
+        self.lbl_status.setText("操作失败")
+        if self._deal_dialog:
+            if uncertain:
+                self._deal_dialog.set_status(
+                    "失败：网络中断，结果不确定，请先刷新确认实际数量"
+                )
+            else:
+                self._deal_dialog.set_status(f"失败：{message}")
+        elif uncertain:
+            QMessageBox.critical(
+                self,
+                "操作失败",
+                f"{message}\n\n网络中断，本次存取结果不确定，"
+                "请先刷新确认实际数量，再决定是否重试。",
+            )
+        else:
+            QMessageBox.critical(self, "操作失败", message)
+
+    def _start_refresh(self, account: dict, force_login: bool = False):
         if self._thread and self._thread.isRunning():
             return
         if not (account.get("password") or "").strip():
-            QMessageBox.warning(self, "提示", "该账号未设置密码，请先编辑填写密码")
-            self.lbl_status.setText(f"账号 {account['account']} 未设置密码，无法查询")
+            if not (account.get("account") or "").strip():
+                QMessageBox.warning(self, "提示", "该行为空白行，无法查询")
+                self.lbl_status.setText("空白行无法查询")
+            else:
+                QMessageBox.warning(self, "提示", "该账号未设置密码，请先编辑填写密码")
+                self.lbl_status.setText(f"账号 {account['account']} 未设置密码，无法查询")
             return
         proxy = None
         if self.chk_proxy.isChecked():
             if not self.edt_proxy_api.text().strip():
                 QMessageBox.warning(self, "提示", "已启用代理，但未填写 API 链接")
                 return
-            proxy = self._proxy_pool.next()
+            proxy = self._proxy_pool.next(account["account"])
             if proxy is None:
                 QMessageBox.warning(
                     self, "代理获取失败", self._proxy_pool.last_error or "代理池为空"
@@ -2369,13 +2691,23 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self.lbl_status.setText(f"正在查询 {account['account']} ...")
         self._thread = AccountDataThread(
+            self._store,
             account["account"],
             account["password"],
             account["device_code"] or None,
             proxy,
+            force_login=force_login,
         )
         self._thread.done.connect(self._on_refresh_done)
         self._thread.failed.connect(self._on_thread_failed)
+        self._thread.cached.connect(
+            lambda acc: self._append_log(
+                f"账号 {acc} 使用缓存会话（金币为缓存值，右键“登录”可强制刷新）"
+            )
+        )
+        self._thread.relogin.connect(
+            lambda acc: self._append_log(f"账号 {acc} 会话失效，已自动重新登录")
+        )
         self._thread.start()
 
     def _apply_refresh_result(self, result: dict):
@@ -2412,6 +2744,17 @@ class MainWindow(QMainWindow):
             bag_raw = result["items"].get(pid, 0)
             if pid == 10000:
                 bag_raw = result.get("money", 0)
+                if (
+                    self._pending_gold_adjust
+                    and result["account"] == self._pending_gold_adjust_account
+                ):
+                    # 金币存取后的刷新：若 money 仍是存取前缓存值，则叠加本地差额；
+                    # 若 money 已变（如强制登录拿到权威值），则不叠加，避免重复计算
+                    if result.get("money", 0) == self._pending_gold_adjust_base:
+                        bag_raw = adjust_bag_gold(bag_raw, self._pending_gold_adjust)
+                    self._pending_gold_adjust = 0
+                    self._pending_gold_adjust_account = ""
+                    self._pending_gold_adjust_base = 0
             elif pid == 20000:
                 bag_raw = result.get("diamond", 0)
             repo_raw = result["repo"].get(pid, 0)
@@ -2435,8 +2778,9 @@ class MainWindow(QMainWindow):
             self.btn_batch_pwd,
             self.btn_test_proxy,
             self.btn_batch_refresh,
-            self.btn_vip_daily,
-            self.btn_thanksgiving,
+            self.btn_welfare_start,
+            self.chk_vip_daily,
+            self.chk_thanksgiving,
             self.chk_proxy,
             self.edt_proxy_api,
         ):
@@ -2510,6 +2854,7 @@ class MainWindow(QMainWindow):
         self.btn_batch_refresh.setEnabled(True)
         self.btn_batch_refresh.setText("停止批量刷新")
         self._batch_worker = BatchRefreshWorker(
+            self._store,
             accounts,
             self._proxy_pool,
             self.spin_delay_min.value(),
@@ -2548,12 +2893,19 @@ class MainWindow(QMainWindow):
     def _welfare_label(self, kind: str) -> str:
         return "每日VIP福利" if kind == "vip_daily" else "感恩日VIP尊享福利"
 
-    def _welfare_button(self, kind: str):
-        return self.btn_vip_daily if kind == "vip_daily" else self.btn_thanksgiving
-
-    def _on_batch_welfare(self, kind: str):
-        label = self._welfare_label(kind)
-        btn = self._welfare_button(kind)
+    def _on_batch_welfare(self):
+        kinds = []
+        if self.chk_vip_daily.isChecked():
+            kinds.append("vip_daily")
+        if self.chk_thanksgiving.isChecked():
+            kinds.append("thanksgiving")
+        if not kinds:
+            QMessageBox.information(
+                self, "提示", "请先勾选要领取的福利类型（每日vip福利领取 / 感恩日领取）"
+            )
+            return
+        label = "、".join(self._welfare_label(k) for k in kinds)
+        btn = self.btn_welfare_start
         if self._welfare_worker and self._welfare_worker.isRunning():
             self._welfare_worker.stop()
             btn.setText("正在停止...")
@@ -2575,15 +2927,15 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         btn.setEnabled(True)
         btn.setText("停止批量领取")
-        self._welfare_kind = kind
         self._welfare_btn = btn
         self._welfare_worker = WelfareWorker(
+            self._store,
             accounts,
             self._proxy_pool,
             self.spin_delay_min.value(),
             self.spin_delay_max.value(),
             enabled,
-            kind,
+            kinds,
         )
         self._welfare_worker.done.connect(self._on_welfare_account_done)
         self._welfare_worker.failed.connect(self._on_welfare_account_failed)
@@ -2595,26 +2947,30 @@ class MainWindow(QMainWindow):
         )
 
     def _on_welfare_account_done(
-        self, account_id: int, account_name: str, kind: str, result: dict
+        self, account_id: int, account_name: str, results: dict
     ):
         self._uncheck_account_row(account_id)
-        if kind == "vip_daily":
-            summary = result.get("summary") or "无明细"
-            self._append_log(
-                f"每日VIP福利领取成功：{account_name}：{summary}"
-            )
-        else:
-            claim = result.get("claim") or {}
-            summary = welfare.format_thanksgiving_summary(claim)
-            self._append_log(
-                f"感恩日VIP尊享福利领取成功：{account_name}：{summary}"
-            )
+        for kind, result in results.items():
+            if isinstance(result, Exception):
+                self._append_log(
+                    f"{self._welfare_label(kind)}领取失败：{account_name}：{result}"
+                )
+            elif kind == "vip_daily":
+                summary = result.get("summary") or "无明细"
+                self._append_log(
+                    f"每日VIP福利领取成功：{account_name}：{summary}"
+                )
+            else:
+                claim = result.get("claim") or {}
+                summary = welfare.format_thanksgiving_summary(claim)
+                self._append_log(
+                    f"感恩日VIP尊享福利领取成功：{account_name}：{summary}"
+                )
 
     def _on_welfare_account_failed(
         self, account_name: str, message: str, proxy: str
     ):
-        label = self._welfare_label(self._welfare_kind)
-        self._append_log(f"{label}领取失败：{account_name}：{message}")
+        self._append_log(f"福利领取失败：{account_name}：{message}")
         if proxy:
             self._append_log(f"失败代理：{mask_proxy(proxy)}")
 
@@ -2622,20 +2978,16 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         btn = self._welfare_btn
         if btn is not None:
-            btn.setText(
-                "每日vip福利领取"
-                if self._welfare_kind == "vip_daily"
-                else "感恩日领取"
-            )
+            btn.setText("开始领取")
         self._append_log("批量领取结束")
 
-    def _acquire_proxy(self) -> str | None:
+    def _acquire_proxy(self, account: str | None = None) -> str | None:
         if not self.chk_proxy.isChecked():
             return None
         if not self.edt_proxy_api.text().strip():
             QMessageBox.warning(self, "提示", "已启用代理，但未填写 API 链接")
             return None
-        proxy = self._proxy_pool.next()
+        proxy = self._proxy_pool.next(account)
         if proxy is None:
             QMessageBox.warning(
                 self, "代理获取失败", self._proxy_pool.last_error or "代理池为空"
@@ -2669,6 +3021,18 @@ class MainWindow(QMainWindow):
             os.startfile(str(log_dir))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "打开失败", f"无法打开日志目录：{exc}")
+
+    def _open_updates_dir(self):
+        try:
+            base = os.environ.get("APPDATA") or str(Path.home() / ".config")
+            updates_dir = Path(base) / "BydsjManager" / "updates"
+            updates_dir.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(updates_dir))
+            self._append_log(
+                f"已打开更新目录：{updates_dir}（含下载的 app_*.exe 与 update_result.log）"
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "打开失败", f"无法打开更新目录：{exc}")
 
     def _parse_version(self, version: str) -> tuple:
         return tuple(int(x) for x in str(version).split("."))
@@ -2791,11 +3155,81 @@ class MainWindow(QMainWindow):
             return
         updater_dst = updates_dir / "updater.exe"
         updates_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(updater_src), str(updater_dst))
-        subprocess.Popen(
-            [str(updater_dst), "--target", target, "--new", new_path]
-        )
+        try:
+            shutil.copy2(str(updater_src), str(updater_dst))
+            subprocess.Popen(
+                [
+                    str(updater_dst),
+                    "--target",
+                    target,
+                    "--new",
+                    new_path,
+                    "--old-pid",
+                    str(os.getpid()),
+                ]
+            )
+        except OSError as exc:
+            try:
+                from updater import write_result
+
+                write_result(target, False, f"更新程序准备/启动失败：{exc}")
+            except Exception:  # noqa: BLE001
+                pass
+            self._append_log(f"更新程序准备/启动失败：{exc}")
+            QMessageBox.critical(
+                self,
+                "更新失败",
+                "无法准备或启动更新程序，可能被安全软件拦截。\n\n"
+                f"错误：{exc}\n\n"
+                "可稍后点“检查更新”重试；若仍失败，请用“打开更新目录”"
+                "手动覆盖更新包。",
+            )
+            return
         QTimer.singleShot(800, QApplication.instance().quit)
+
+    def _report_last_update_failure(self):
+        """启动后检查 updater 结果日志：最近 24 小时内更新失败则提示手动方案。"""
+        try:
+            base = os.environ.get("APPDATA") or str(Path.home() / ".config")
+            log_file = Path(base) / "BydsjManager" / "updates" / "update_result.log"
+            if not log_file.exists():
+                return
+            lines = [
+                line.strip()
+                for line in log_file.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                if line.strip()
+            ]
+            if not lines:
+                return
+            last = lines[-1]
+            if " ok=1 " in last:
+                self._append_log("上次热更新已成功应用")
+                return
+            try:
+                when = datetime.strptime(last[1:20], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return
+            if (datetime.now() - when).total_seconds() > 86400:
+                return
+            self._append_log("检测到上次自动更新失败：" + last)
+            updates_dir = Path(base) / "BydsjManager" / "updates"
+            QMessageBox.warning(
+                self,
+                "上次更新未成功",
+                "上次自动更新没有成功，可能被 Windows 安全功能拦截。\n\n"
+                "建议按顺序尝试：\n"
+                "1) 把 BydsjApp.exe 移到桌面以外（例如 C:\\BydsjApp\\），"
+                "再打开软件点“检查更新”重试；\n"
+                "2) 在“Windows 安全中心 → 病毒和威胁防护 → 勒索软件防护 → "
+                "允许应用”中，把更新目录里的 updater.exe 加入允许列表；\n"
+                "3) 手动更新：把下面目录里的 app_*.exe 复制覆盖到软件目录：\n"
+                f"{updates_dir}\n\n"
+                "完成后再打开软件即可。",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _apply_password_change(self, account: dict, new_password: str):
         self._store.update_account(
@@ -2805,6 +3239,8 @@ class MainWindow(QMainWindow):
             account["device_code"],
             account["phone"],
         )
+        # 密码已变，旧会话作废
+        self._store.clear_session(account["account"])
         self._reload_accounts()
         self._uncheck_account_row(account["id"])
         self.lbl_status.setText(f"账号 {account['account']} 密码已修改并更新")
@@ -2848,13 +3284,20 @@ class MainWindow(QMainWindow):
             except ValueError as exc:
                 QMessageBox.warning(self, "提示", str(exc))
                 return
-        accounts = [self._account_at(row) for row in rows]
+        accounts = [
+            self._account_at(row)
+            for row in rows
+            if self._account_at(row) and self._account_at(row)["account"].strip()
+        ]
+        if not accounts:
+            QMessageBox.information(self, "提示", "勾选的均为空白行，请勾选要批量改密的账号")
+            return
         self._append_log(f"开始批量改密，共 {len(accounts)} 个账号")
         for index, (account, new_pwd) in enumerate(zip(accounts, passwords), 1):
             if not account:
                 continue
             self._append_log(f"正在处理 {index}/{len(accounts)}：{account['account']}")
-            proxy = self._acquire_proxy()
+            proxy = self._acquire_proxy(account["account"])
             if self.chk_proxy.isChecked() and proxy is None:
                 self._append_log(f"账号 {account['account']} 代理获取失败，跳过")
                 continue
@@ -2864,6 +3307,7 @@ class MainWindow(QMainWindow):
                 batch_index=index,
                 batch_total=len(accounts),
                 proxy=proxy,
+                store=self._store,
             )
             if dialog.exec() == QDialog.Accepted:
                 self._apply_password_change(account, new_pwd)
@@ -2922,19 +3366,28 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _resolve_app_icon() -> Path | None:
+    """定位 app_icon.ico：兼容 PyInstaller(_MEIPASS)/Nuitka(__file__)/开发模式。"""
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "assets" / "app_icon.ico")
+    candidates.append(Path(__file__).resolve().parent / "assets" / "app_icon.ico")
+    if getattr(sys, "frozen", False):
+        candidates.append(
+            Path(sys.executable).resolve().parent / "assets" / "app_icon.ico"
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def main():
     app = QApplication(sys.argv)
     # 【热更新/打包】设置程序窗口图标（任务栏/标题栏）
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        icon_path = (
-            Path(meipass) / "assets" / "app_icon.ico"
-            if meipass
-            else Path(sys.executable).resolve().parent / "assets" / "app_icon.ico"
-        )
-    else:
-        icon_path = Path(__file__).resolve().parent / "assets" / "app_icon.ico"
-    if icon_path.exists():
+    icon_path = _resolve_app_icon()
+    if icon_path:
         app.setWindowIcon(QIcon(str(icon_path)))
     # 【美化新增-浅色Fluent】全局复选框蓝色勾选
     app.setStyle(FluentProxyStyle(app.style()))
@@ -2944,13 +3397,14 @@ def main():
     if dialog.exec() != QDialog.Accepted:
         return
     win = MainWindow(dialog.store, dialog.card_key, dialog.server_url)
-    if icon_path.exists():
+    if icon_path:
         win.setWindowIcon(QIcon(str(icon_path)))
     win._append_log("════════════════════════════════════════")
     win._append_log(f"[会话开始] {datetime.now():%Y-%m-%d %H:%M:%S} 版本 {APP_VERSION}")
     win._append_log(f"卡密：{mask_card_key(dialog.card_key)}")
     win._append_log("════════════════════════════════════════")
     win.show()
+    QTimer.singleShot(2000, win._report_last_update_failure)
     sys.exit(app.exec())
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import urllib.parse
 
 import httpx
@@ -12,6 +13,40 @@ from scripts import bydsj_client, gaia_login, query_service
 SAFETY_BASE = "https://lobby.bydsj3d.com/safety/"
 CODE_TYPE_TRUST = 19
 CODE_TYPE_CHANGE_PWD = 13
+
+# 会话缓存：按账号串行化“取缓存/登录回写”，避免并发重复登录
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+def _account_lock(account: str) -> threading.Lock:
+    with _session_locks_guard:
+        lock = _session_locks.get(account)
+        if lock is None:
+            lock = _session_locks[account] = threading.Lock()
+        return lock
+
+
+def session_fingerprint(
+    account: str,
+    password: str,
+    device_code: str | None,
+    login_type: str,
+    require_device: bool = False,
+) -> str:
+    """会话指纹：账号/密码/设备码/登录类型任一变化都会让旧会话作废。"""
+    raw = f"{account}|{password}|{device_code or ''}|{login_type}|{1 if require_device else 0}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def is_session_invalid(exc: Exception) -> bool:
+    """判断异常是否表示游戏会话失效（0xFFFFFFFF / 登录已失效等关键词）。"""
+    text = str(exc)
+    if not text:
+        return False
+    return any(
+        keyword in text for keyword in bydsj_client.SESSION_INVALID_KEYWORDS
+    ) or f"iResult={bydsj_client.SESSION_INVALID_RESULT}" in text
 
 
 def get_session(
@@ -50,6 +85,83 @@ def get_session(
         sess["account"] = account
     sess["device_code"] = device_code
     return sess
+
+
+def get_cached_session(
+    store,
+    account: str,
+    password: str,
+    device_code: str | None = None,
+    proxy: str | None = None,
+    require_device: bool = False,
+    force: bool = False,
+) -> dict:
+    """优先复用本地加密缓存的会话；未命中/指纹不符/强制时走完整登录并回写缓存。"""
+    login_type = query_service.login_type_of(account)
+    with _account_lock(account):
+        if not force:
+            cached = store.load_session(account)
+            if cached:
+                fp = session_fingerprint(
+                    account, password, device_code, login_type, require_device
+                )
+                if (
+                    cached.get("_fp") == fp
+                    and cached.get("token")
+                    and cached.get("user_id") is not None
+                ):
+                    cached["_cached"] = True
+                    return cached
+        session = get_session(
+            account, password, device_code, proxy, require_device=require_device
+        )
+        session["_fp"] = session_fingerprint(
+            account, password, device_code, login_type, require_device
+        )
+        session.pop("_cached", None)
+        store.save_session(account, session)
+        session["_cached"] = False
+        return session
+
+
+def run_with_session(
+    store,
+    account: str,
+    password: str,
+    device_code: str | None = None,
+    proxy: str | None = None,
+    fn=None,
+    require_device: bool = False,
+    force: bool = False,
+    on_cached=None,
+    on_relogin=None,
+):
+    """用（缓存）会话执行 fn(session)；会话失效时清缓存→强制登录→重试一次。"""
+
+    def _obtain(force_login: bool) -> dict:
+        session = get_cached_session(
+            store,
+            account,
+            password,
+            device_code,
+            proxy,
+            require_device=require_device,
+            force=force_login,
+        )
+        if on_cached and session.get("_cached"):
+            on_cached()
+        return session
+
+    session = _obtain(force)
+    try:
+        return fn(session)
+    except Exception as exc:  # noqa: BLE001
+        if not is_session_invalid(exc):
+            raise
+        store.clear_session(account)
+        if on_relogin:
+            on_relogin()
+        return fn(_obtain(True))
 
 
 def build_security_url(session: dict, mac: str) -> str:

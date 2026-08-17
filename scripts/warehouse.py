@@ -38,6 +38,15 @@ def deal_max_display(prop_id: int, source_raw: int) -> int:
     return source_raw
 
 
+def adjust_bag_gold(bag_raw: int, deal_num: int) -> int:
+    """金币存取后本地推算背包金币（协议 raw 单位=万）。
+
+    deal_num 正数=存入（背包减少），负数=取出（背包增加）。
+    显示值(亿) = raw ÷ 10000；提交值 = 输入(亿) × 10000（见 display_to_deal_num）。
+    """
+    return bag_raw - deal_num
+
+
 def get_repo(
     user_id: int,
     token: str,

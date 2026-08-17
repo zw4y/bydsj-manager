@@ -56,6 +56,10 @@ class LocalAccountStore:
             conn.execute("ALTER TABLE accounts ADD COLUMN cannon INTEGER NOT NULL DEFAULT 0")
         if "sort_order" not in columns:
             conn.execute("ALTER TABLE accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+        if "enc_session" not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN enc_session TEXT")
+        if "is_blank" not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN is_blank INTEGER NOT NULL DEFAULT 0")
 
     def _encrypt(self, plaintext: str) -> str:
         nonce = os.urandom(12)
@@ -80,6 +84,7 @@ class LocalAccountStore:
         total_infull_num: int = 0,
         cannon: int = 0,
         sort_order: int | None = None,
+        is_blank: int = 0,
     ) -> dict:
         now = datetime.now().isoformat(timespec="seconds")
         enc_pwd = self._encrypt(password)
@@ -93,8 +98,8 @@ class LocalAccountStore:
                 """
                 INSERT INTO accounts(account, enc_password, enc_secondary_password, login_type,
                                      cached_user_id, nickname, device_code, phone, total_infull_num,
-                                     cannon, sort_order, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     cannon, sort_order, is_blank, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account) DO UPDATE SET
                     enc_password = excluded.enc_password,
                     enc_secondary_password = excluded.enc_secondary_password,
@@ -106,6 +111,7 @@ class LocalAccountStore:
                     total_infull_num = excluded.total_infull_num,
                     cannon = excluded.cannon,
                     sort_order = accounts.sort_order,
+                    is_blank = excluded.is_blank,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -120,12 +126,23 @@ class LocalAccountStore:
                     total_infull_num or 0,
                     cannon or 0,
                     sort_order,
+                    is_blank or 0,
                     now,
                     now,
                 ),
             )
             row = conn.execute("SELECT * FROM accounts WHERE account = ?", (account,)).fetchone()
         return dict(row)
+
+    def add_blank_row(self, sort_order: int | None = None) -> dict:
+        """新增持久化空白行：合成账号落库，界面不显示该合成值。"""
+        import uuid
+
+        account = f"__blank__{uuid.uuid4().hex[:12]}"
+        return self.add_account(
+            account, "", "", "blank", None, "", "", "", 0, 0,
+            sort_order=sort_order, is_blank=1,
+        )
 
     def list_accounts(self) -> list[dict]:
         with self._connect() as conn:
@@ -169,6 +186,7 @@ class LocalAccountStore:
         total_infull_num: int | None = None,
         account: str | None = None,
         cannon: int | None = None,
+        is_blank: int | None = None,
     ) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         with self._connect() as conn:
@@ -183,6 +201,7 @@ class LocalAccountStore:
                     nickname = COALESCE(?, nickname),
                     total_infull_num = COALESCE(?, total_infull_num),
                     cannon = COALESCE(?, cannon),
+                    is_blank = COALESCE(?, is_blank),
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -195,6 +214,7 @@ class LocalAccountStore:
                     nickname,
                     total_infull_num,
                     cannon,
+                    is_blank,
                     now,
                     account_id,
                 ),
@@ -209,3 +229,36 @@ class LocalAccountStore:
                     "UPDATE accounts SET sort_order = ? WHERE id = ?",
                     (index, row["id"]),
                 )
+
+    def save_session(self, account: str, session: dict) -> None:
+        """把会话（token 等）加密写入账号库；session 需可 JSON 序列化。"""
+        import json
+
+        blob = self._encrypt(json.dumps(session, ensure_ascii=False))
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET enc_session = ?, updated_at = ? WHERE account = ?",
+                (blob, datetime.now().isoformat(timespec="seconds"), account),
+            )
+
+    def load_session(self, account: str) -> dict | None:
+        """读取加密会话；不存在或解析失败返回 None。"""
+        import json
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT enc_session FROM accounts WHERE account = ?", (account,)
+            ).fetchone()
+        if not row or not row["enc_session"]:
+            return None
+        try:
+            return json.loads(self._decrypt(row["enc_session"]))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def clear_session(self, account: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET enc_session = NULL, updated_at = ? WHERE account = ?",
+                (datetime.now().isoformat(timespec="seconds"), account),
+            )

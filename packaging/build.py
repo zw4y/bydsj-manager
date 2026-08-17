@@ -41,6 +41,7 @@ def build_nuitka_app() -> None:
         [
             f"--output-dir={DIST / 'nuitka_build'}",
             "--output-filename=BydsjApp.exe",
+            f"--windows-icon-from-ico={ROOT / 'assets' / 'app_icon.ico'}",
             f"--include-data-file={ROOT / 'data' / 'flow5_template.bin'}=data/flow5_template.bin",
             f"--include-data-file={ROOT / 'data' / 'tokenlogin_template.bin'}=data/tokenlogin_template.bin",
             f"--include-data-dir={ROOT / 'assets'}=assets",

@@ -11,6 +11,9 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+# 代理 API 缺省时效（分钟）：链接没带 lifetime 时按此兜底
+DEFAULT_LIFETIME_MINUTES = 5
+
 
 def proxy_config_path() -> Path:
     base = os.environ.get("APPDATA") or str(Path.home() / ".config")
@@ -20,10 +23,36 @@ def proxy_config_path() -> Path:
 def _lifetime_minutes(api_url: str) -> int:
     try:
         query = urllib.parse.urlsplit(api_url).query
-        value = urllib.parse.parse_qs(query).get("lifetime", ["3"])[0]
+        value = urllib.parse.parse_qs(query).get(
+            "lifetime", [str(DEFAULT_LIFETIME_MINUTES)]
+        )[0]
         return max(1, int(value))
     except Exception:
-        return 3
+        return DEFAULT_LIFETIME_MINUTES
+
+
+def normalize_api_url(
+    api_url: str, default_lifetime: int = DEFAULT_LIFETIME_MINUTES
+) -> str:
+    """自动补齐代理 API 参数（用户无需手动改链接）：
+    - format=json：统一结构化返回；
+    - detail=1：返回真实 deadline（过期时间），轮换精确；
+    - lifetime：缺失时按默认时效兜底。
+    已存在的参数保持不变，不重复添加。
+    """
+    parsed = urllib.parse.urlsplit(api_url)
+    pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    keys = {key for key, _ in pairs}
+    if "format" not in keys:
+        pairs.append(("format", "json"))
+    if "detail" not in keys:
+        pairs.append(("detail", "1"))
+    if "lifetime" not in keys:
+        pairs.append(("lifetime", str(max(1, int(default_lifetime)))))
+    query = urllib.parse.urlencode(pairs)
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment)
+    )
 
 
 def _parse_deadline(value: str | None, api_url: str) -> float:
@@ -108,6 +137,7 @@ def _parse_text_entries(text: str, api_url: str) -> list[dict]:
 
 def fetch_proxies(api_url: str, timeout: float = 15.0) -> list[dict]:
     """调用代理 API，返回代理条目列表（含 proxy/deadline_ts）。"""
+    api_url = normalize_api_url(api_url)
     req = urllib.request.Request(api_url, method="GET")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=timeout) as resp:
@@ -178,6 +208,7 @@ class ProxyPool:
         self._random = random_order
         self._entries: list[dict] = []
         self._index = 0
+        self._bindings: dict[str, str] = {}
         self.fetch_count = 0
         self.last_error: str | None = None
 
@@ -189,6 +220,7 @@ class ProxyPool:
         self._random = random_order
         self._entries = []
         self._index = 0
+        self._bindings = {}
         self.fetch_count = 0
         self.last_error = None
 
@@ -199,13 +231,28 @@ class ProxyPool:
         self._index = 0
         self.fetch_count += 1
 
-    def next(self) -> str | None:
+    def next(self, account: str | None = None) -> str | None:
+        """取一个可用代理；传入账号时优先复用该账号绑定的 IP（账号-IP 亲和）。
+
+        绑定的 IP 有效期内同一账号始终走同一出口 IP，避免游戏会话因 IP 变化失效；
+        IP 过期/超载/失败后自动换新 IP 并重新绑定。
+        """
         now = time.time()
         self._entries = [
             e
             for e in self._entries
             if e["deadline_ts"] > now and e["used"] < self._cap
         ]
+        if account:
+            bound = self._bindings.get(account)
+            if bound is not None:
+                entry = next(
+                    (e for e in self._entries if e["proxy"] == bound), None
+                )
+                if entry is not None:
+                    entry["used"] += 1
+                    return entry["proxy"]
+                self._bindings.pop(account, None)
         if not self._entries and self._api_url:
             try:
                 self._refill()
@@ -220,10 +267,15 @@ class ProxyPool:
             entry = self._entries[self._index % len(self._entries)]
             self._index += 1
         entry["used"] += 1
+        if account:
+            self._bindings[account] = entry["proxy"]
         return entry["proxy"]
 
     def mark_failed(self, proxy: str) -> None:
         self._entries = [e for e in self._entries if e["proxy"] != proxy]
+        self._bindings = {
+            acc: p for acc, p in self._bindings.items() if p != proxy
+        }
 
     def mask(self, proxy: str) -> str:
         return mask_proxy(proxy)

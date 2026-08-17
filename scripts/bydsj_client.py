@@ -25,6 +25,10 @@ PROTO_VER = 33
 AGENT_ID = 10000046
 GAME_VER = 602
 
+# 会话失效信号（抓包实证：iResult=0xFFFFFFFF + “本次登录已失效，重新登录后再试”）
+SESSION_INVALID_RESULT = 0xFFFFFFFF
+SESSION_INVALID_KEYWORDS = ("登录已失效", "登录失效", "重新登录", "4294967295")
+
 # 设备画像（来自抓包样本，后续可做成每账号/实例配置）
 ANDROID_ID = "157bc3df28f459f0"
 
@@ -288,6 +292,10 @@ def get_bag(user_id: int, token: str, proxy: str | None = None) -> dict[int, int
     if len(resp) < 4:
         raise ProtocolError("bag response too short")
     count = struct.unpack_from("<I", resp, 0)[0]
+    if count == SESSION_INVALID_RESULT:
+        detail = _resp_error_message(resp)
+        suffix = f": {detail}" if detail else ""
+        raise ProtocolError(f"背包查询失败 iResult={count}{suffix}")
     items = {}
     for i in range(count):
         off = 4 + i * 8

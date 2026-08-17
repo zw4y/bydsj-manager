@@ -39,6 +39,75 @@ def test_delete_removes_account(store):
     assert store.list_accounts() == []
 
 
+def test_add_blank_row_persists_with_is_blank(store):
+    row = store.add_blank_row()
+    items = store.list_accounts()
+    assert len(items) == 1
+    assert items[0]["is_blank"] == 1
+    assert items[0]["account"].startswith("__blank__")
+    assert items[0]["password"] == ""
+    # 合成账号唯一，可加多行
+    row2 = store.add_blank_row()
+    assert row["id"] != row2["id"]
+    assert len({a["account"] for a in store.list_accounts()}) == 2
+
+
+def test_blank_row_convert_to_account(store):
+    blank = store.add_blank_row()
+    store.update_account(
+        blank["id"],
+        "pwd1",
+        "sec1",
+        None,
+        None,
+        None,
+        None,
+        "真实账号",
+        0,
+        is_blank=0,
+    )
+    items = store.list_accounts()
+    assert len(items) == 1
+    assert items[0]["is_blank"] == 0
+    assert items[0]["account"] == "真实账号"
+    assert items[0]["password"] == "pwd1"
+
+
+def test_blank_row_saves_fields_without_account(store):
+    blank = store.add_blank_row()
+    store.update_account(
+        blank["id"],
+        "pwd9",
+        "",
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        is_blank=1,
+    )
+    items = store.list_accounts()
+    assert items[0]["is_blank"] == 1
+    assert items[0]["account"].startswith("__blank__")
+    assert items[0]["password"] == "pwd9"
+
+
+def test_blank_row_deleted_by_id(store):
+    blank = store.add_blank_row()
+    store.delete_account(blank["id"])
+    assert store.list_accounts() == []
+
+
+def test_blank_row_order_via_renumber(store):
+    a = store.add_account("账号A", "p", "", "passport")
+    b = store.add_blank_row()
+    c = store.add_account("账号C", "p", "", "passport")
+    store.renumber_accounts([b["id"], a["id"], c["id"]])
+    items = store.list_accounts()
+    assert [x["id"] for x in items] == [b["id"], a["id"], c["id"]]
+
+
 def test_db_file_contains_no_plaintext_password(tmp_path):
     db_path = tmp_path / "accounts.db"
     LocalAccountStore(str(db_path), KEY).add_account("wzj1004232242", "zf6114", "SecondP@ss#2026", "passport")
